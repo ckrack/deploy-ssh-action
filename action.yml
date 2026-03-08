@@ -11,6 +11,10 @@ inputs:
   docroot:
     required: true
     description: Remote docroot symlink path (e.g., /var/www/html)
+  docroot_path:
+    required: false
+    description: Subdirectory within the release to use as docroot (e.g., /public). Leave empty to use the release root.
+    default: ''
   release_group:
     required: true
     description: Release group prefix (e.g., staging, prod) to isolate releases
@@ -82,6 +86,7 @@ runs:
         RELEASE: ${{ env.RELEASE }}
         PROJECT_PATH: ${{ inputs.project_path }}
         DOCROOT: ${{ inputs.docroot }}
+        DOCROOT_PATH: ${{ inputs.docroot_path }}
         RELEASE_GROUP: ${{ inputs.release_group }}
         SHARED_FILES: ${{ inputs.shared_files }}
         SHARED_DIRS: ${{ inputs.shared_dirs }}
@@ -92,7 +97,7 @@ runs:
         username: ${{ inputs.ssh_user }}
         key: ${{ inputs.ssh_key }}
         passphrase: ${{ inputs.ssh_passphrase }}
-        envs: RELEASE,PROJECT_PATH,DOCROOT,RELEASE_GROUP,SHARED_FILES,SHARED_DIRS,REMOTE_COMMANDS,CLEANUP
+        envs: RELEASE,PROJECT_PATH,DOCROOT,DOCROOT_PATH,RELEASE_GROUP,SHARED_FILES,SHARED_DIRS,REMOTE_COMMANDS,CLEANUP
         script: |
           set -e
           RELEASE_PATH="${PROJECT_PATH}/releases/${RELEASE}"
@@ -127,7 +132,11 @@ runs:
           PREVIOUS_RELEASE=""
           if [ -L "${DOCROOT}" ]; then
             CURRENT_TARGET=$(readlink -f "${DOCROOT}")
-            POTENTIAL_RELEASE=$(dirname "${CURRENT_TARGET}")
+            if [ -n "${DOCROOT_PATH}" ]; then
+              POTENTIAL_RELEASE=$(dirname "${CURRENT_TARGET}")
+            else
+              POTENTIAL_RELEASE="${CURRENT_TARGET}"
+            fi
             if echo "${POTENTIAL_RELEASE}" | grep -q "^${PROJECT_PATH}/releases/."; then
               PREVIOUS_RELEASE="${POTENTIAL_RELEASE}"
               echo "  Previous release: ${PREVIOUS_RELEASE}"
@@ -137,7 +146,7 @@ runs:
           fi
 
           echo "==> Activating release"
-          ln -sfn "${RELEASE_PATH}/public" "${DOCROOT}"
+          ln -sfn "${RELEASE_PATH}${DOCROOT_PATH}" "${DOCROOT}"
 
           if [ "${CLEANUP}" = "true" ]; then
             echo "==> Cleaning up old ${RELEASE_GROUP} releases"
