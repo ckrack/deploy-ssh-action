@@ -1,0 +1,158 @@
+name: Deploy via rsync
+description: >
+  Deploy a release to a remote server via rsync and SSH.
+  Handles release directory creation, shared file/directory symlinking,
+  remote command execution, release activation, and old release cleanup.
+
+inputs:
+  project_path:
+    required: true
+    description: Remote project base path (e.g., /var/www/project)
+  docroot:
+    required: true
+    description: Remote docroot symlink path (e.g., /var/www/html)
+  release_group:
+    required: true
+    description: Release group prefix (e.g., staging, prod) to isolate releases
+  rsync_switches:
+    required: false
+    description: Flags and options passed to rsync
+  rsync_debug:
+    required: false
+    description: Enable rsync debug output
+    default: 'true'
+  shared_files:
+    required: false
+    description: Newline-separated list of shared files to symlink into the release
+  shared_dirs:
+    required: false
+    description: Newline-separated list of shared directories to symlink into the release
+  remote_commands:
+    required: false
+    description: Shell commands to run inside the release directory after rsync and symlinking (before activation)
+    default: ''
+  cleanup:
+    required: false
+    description: Remove old releases from the same release group after activation
+    default: 'false'
+  ssh_host:
+    required: true
+    description: Remote SSH host
+  ssh_user:
+    required: true
+    description: Remote SSH user
+  ssh_key:
+    required: true
+    description: SSH private key
+  ssh_passphrase:
+    required: false
+    description: SSH key passphrase
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Determine release name
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          TAG="pr-${{ github.event.pull_request.number }}-$(git rev-parse --short HEAD)"
+        else
+          TAG="${GITHUB_REF_NAME}"
+          if [ -z "$TAG" ] || [ "$TAG" = "main" ] || [ "$TAG" = "master" ]; then
+            TAG="$(date +'%Y.%m.%d')-$(git rev-parse --short HEAD)"
+          fi
+        fi
+        echo "RELEASE=${{ inputs.release_group }}-$TAG" >> $GITHUB_ENV
+
+    - name: Rsync to server
+      uses: burnett01/rsync-deployments@dc0d5d44c4728aad3f02154a87309809e62a960f # 8.0.4
+      with:
+        switches: ${{ inputs.rsync_switches }}
+        debug: ${{ inputs.rsync_debug }}
+        remote_path: ${{ inputs.project_path }}/releases/${{ env.RELEASE }}/
+        remote_host: ${{ inputs.ssh_host }}
+        remote_user: ${{ inputs.ssh_user }}
+        remote_key: ${{ inputs.ssh_key }}
+        remote_key_pass: ${{ inputs.ssh_passphrase }}
+
+    - name: Build and activate release
+      uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+      env:
+        RELEASE: ${{ env.RELEASE }}
+        PROJECT_PATH: ${{ inputs.project_path }}
+        DOCROOT: ${{ inputs.docroot }}
+        RELEASE_GROUP: ${{ inputs.release_group }}
+        SHARED_FILES: ${{ inputs.shared_files }}
+        SHARED_DIRS: ${{ inputs.shared_dirs }}
+        REMOTE_COMMANDS: ${{ inputs.remote_commands }}
+        CLEANUP: ${{ inputs.cleanup }}
+      with:
+        host: ${{ inputs.ssh_host }}
+        username: ${{ inputs.ssh_user }}
+        key: ${{ inputs.ssh_key }}
+        passphrase: ${{ inputs.ssh_passphrase }}
+        envs: RELEASE,PROJECT_PATH,DOCROOT,RELEASE_GROUP,SHARED_FILES,SHARED_DIRS,REMOTE_COMMANDS,CLEANUP
+        script: |
+          set -e
+          RELEASE_PATH="${PROJECT_PATH}/releases/${RELEASE}"
+
+          echo "==> Creating shared directories"
+          echo "$SHARED_DIRS" | tr ',' '\n' | while read -r dir; do
+            dir=$(echo "$dir" | xargs)
+            [ -z "$dir" ] && continue
+            mkdir -p "${PROJECT_PATH}/${dir}"
+            rm -rf "${RELEASE_PATH}/${dir}"
+            mkdir -p "$(dirname "${RELEASE_PATH}/${dir}")"
+            ln -sfn "${PROJECT_PATH}/${dir}" "${RELEASE_PATH}/${dir}"
+            echo "  Linked ${dir}"
+          done
+
+          echo "==> Linking shared files"
+          echo "$SHARED_FILES" | tr ',' '\n' | while read -r file; do
+            file=$(echo "$file" | xargs)
+            [ -z "$file" ] && continue
+            mkdir -p "$(dirname "${RELEASE_PATH}/${file}")"
+            ln -sfn "${PROJECT_PATH}/${file}" "${RELEASE_PATH}/${file}"
+            echo "  Linked ${file}"
+          done
+
+          if [ -n "$REMOTE_COMMANDS" ]; then
+            echo "==> Running remote commands"
+            cd "${RELEASE_PATH}"
+            eval "$REMOTE_COMMANDS"
+          fi
+
+          echo "==> Determining previous release"
+          PREVIOUS_RELEASE=""
+          if [ -L "${DOCROOT}" ]; then
+            CURRENT_TARGET=$(readlink -f "${DOCROOT}")
+            POTENTIAL_RELEASE=$(dirname "${CURRENT_TARGET}")
+            if echo "${POTENTIAL_RELEASE}" | grep -q "^${PROJECT_PATH}/releases/."; then
+              PREVIOUS_RELEASE="${POTENTIAL_RELEASE}"
+              echo "  Previous release: ${PREVIOUS_RELEASE}"
+            else
+              echo "  No valid previous release found (DOCROOT does not point to a release)"
+            fi
+          fi
+
+          echo "==> Activating release"
+          ln -sfn "${RELEASE_PATH}/public" "${DOCROOT}"
+
+          if [ "${CLEANUP}" = "true" ]; then
+            echo "==> Cleaning up old ${RELEASE_GROUP} releases"
+            cd "${PROJECT_PATH}/releases"
+            for dir in "${RELEASE_GROUP}"-*/; do
+              dir="${dir%/}"
+              [ "$dir" = "${RELEASE_GROUP}-*" ] && continue
+              FULL_PATH="${PROJECT_PATH}/releases/${dir}"
+              [ "${FULL_PATH}" = "${RELEASE_PATH}" ] && continue
+              [ -n "${PREVIOUS_RELEASE}" ] && [ "${FULL_PATH}" = "${PREVIOUS_RELEASE}" ] && continue
+              echo "  Removing old release: ${dir}"
+              rm -rf "${FULL_PATH}"
+            done
+          else
+            echo "==> Skipping cleanup (cleanup=false)"
+          fi
+
+          echo "==> Deploy complete: ${RELEASE}"
